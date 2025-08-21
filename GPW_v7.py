@@ -734,6 +734,9 @@ def _soft_vote_proba(p_rf, p_xgb, p_lgb, w):
     return w["rf"]*p_rf + w["xgb"]*p_xgb + w["lgb"]*p_lgb    
 
 def walk_forward_evaluate_stacking(feat_frames, train_days, test_days, step_days):
+    # lokalne importy (żeby nie modyfikować nagłówka pliku)
+    from sklearn.calibration import CalibratedClassifierCV
+
     all_feat = pd.concat(feat_frames, axis=0, sort=False).sort_index()
     X_cols = [c for c in all_feat.columns if c not in ("y","FWD_RET","CLOSE","Ticker")]
 
@@ -764,16 +767,53 @@ def walk_forward_evaluate_stacking(feat_frames, train_days, test_days, step_days
         X_train, med = sanitize_matrix(X_train, None)
         X_test, _    = sanitize_matrix(X_test, med)
 
+        # === (1) Stacking z OOF (jak było) — daje meta-klasyfikator
         oof_meta, bundle = build_oof_and_fit_bases(X_train, y_train, n_splits=3)
 
-        proba_rf  = bundle["rf"].predict_proba(X_test)[:,1]
-        proba_xgb = bundle["xgb"].predict_proba(X_test)[:,1]
-        proba_lgb = bundle["lgb"].predict_proba(X_test)[:,1]
-        meta_X_test = np.column_stack([proba_rf, proba_xgb, proba_lgb])
+        # Predykcje bazowe na teście (do meta)
+        proba_rf_base  = bundle["rf"].predict_proba(X_test)[:,1]
+        proba_xgb_base = bundle["xgb"].predict_proba(X_test)[:,1]
+        proba_lgb_base = bundle["lgb"].predict_proba(X_test)[:,1]
+        meta_X_test = np.column_stack([proba_rf_base, proba_xgb_base, proba_lgb_base])
+        proba_meta = bundle["meta"].predict_proba(meta_X_test)[:,1]
 
-        proba_ens = bundle["meta"].predict_proba(meta_X_test)[:,1]
+        # === (2) Kalibracja baz (Platt/sigmoid, cv=3) + alternatywne blendy
+        # Dopasuj świeże (niezależne) kopie bazowych modeli i skalibruj na X_train
+        # (używamy tych samych ustawień co make_base_models() przez policzenie spw)
+        pos = int((y_train == 1).sum()); neg = int((y_train == 0).sum())
+        spw = (neg / max(pos, 1))
+        rf0, xgb0, lgb0 = make_base_models(spw)
+
+        rf0.fit(X_train, y_train)
+        xgb0.fit(X_train, y_train)
+        lgb0.fit(X_train, y_train)
+
+        rf_cal  = CalibratedClassifierCV(rf0,  cv=3, method="sigmoid").fit(X_train, y_train)
+        xgb_cal = CalibratedClassifierCV(xgb0, cv=3, method="sigmoid").fit(X_train, y_train)
+        lgb_cal = CalibratedClassifierCV(lgb0, cv=3, method="sigmoid").fit(X_train, y_train)
+
+        p_rf  = rf_cal.predict_proba(X_test)[:,1]
+        p_xgb = xgb_cal.predict_proba(X_test)[:,1]
+        p_lgb = lgb_cal.predict_proba(X_test)[:,1]
+
+        # Soft voting (średnia skalibrowanych prawdopodobieństw)
+        proba_soft = (p_rf + p_xgb + p_lgb) / 3.0
+
+        # Rank voting (średnia znormalizowanych rang)
+        def _rank_avg(pvec):
+            r = pd.Series(pvec).rank(method="average")  # 1..N
+            return (r - 1.0) / max(len(r) - 1.0, 1.0)   # 0..1
+        r_rf  = _rank_avg(p_rf)
+        r_xgb = _rank_avg(p_xgb)
+        r_lgb = _rank_avg(p_lgb)
+        proba_rank = (r_rf + r_xgb + r_lgb) / 3.0
+        proba_rank = proba_rank.values.astype(float)
+
+        # === (3) Końcowy blend: 50% meta + 25% soft + 25% rank
+        proba_ens = 0.50 * proba_meta + 0.25 * proba_soft + 0.25 * proba_rank
+
+        # === (4) Metryki okna
         y_true    = y_test.values
-
         auc = roc_auc_score(y_true, proba_ens) if len(np.unique(y_true))>1 else np.nan
         ap  = average_precision_score(y_true, proba_ens) if len(y_true)>0 else np.nan
         y_pred = (proba_ens >= 0.5).astype(int)
@@ -789,6 +829,7 @@ def walk_forward_evaluate_stacking(feat_frames, train_days, test_days, step_days
 
         overall_true.append(y_true)
         overall_proba.append(proba_ens)
+        # Zachowujemy bundle do predykcji „predict” (meta + bazy + mediany)
         last_bundle = {"models": bundle, "X_cols": X_cols, "median_fill": med}
 
     if not window_metrics:
@@ -798,6 +839,7 @@ def walk_forward_evaluate_stacking(feat_frames, train_days, test_days, step_days
     overall_true = np.concatenate(overall_true)
     overall_proba= np.concatenate(overall_proba)
     return metrics_df, overall_true, overall_proba, last_bundle, X_cols
+
 
 def _compute_atr14(df_prices):
     prev = df_prices["CLOSE"].shift(1)
